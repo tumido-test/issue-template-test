@@ -1,0 +1,128 @@
+---
+name: Feedback Screenshot Upload
+
+"on":
+  issues:
+    types: [opened, edited]
+
+jobs:
+  upload-screenshot:
+    if: >-
+      contains(
+        github.event.issue.body,
+        'FEEDBACK_SCREENSHOT_BASE64'
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Extract and upload screenshot
+        # v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            const body = context.payload.issue.body;
+            const re = new RegExp(
+              '<!-- FEEDBACK_SCREENSHOT_BASE64\\s+' +
+              '(data:image\\/[^\\s]\\S+)' +
+              '\\s+FEEDBACK_SCREENSHOT_BASE64 -->',
+              's'
+            );
+            const match = body.match(re);
+            if (!match) {
+              core.info('No base64 screenshot found');
+              return;
+            }
+
+            const dataUrl = match[1].trim();
+            const b64 = dataUrl.match(
+              /^data:image\/(\w+);base64,(.+)$/s
+            );
+            if (!b64) {
+              core.warning('Invalid data URL format');
+              return;
+            }
+
+            const binary = Buffer.from(b64[2], 'base64');
+
+            const repo = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const policyRes = await fetch(
+              'https://github.com/upload/policies/assets',
+              {
+                method: 'POST',
+                headers: {
+                  Authorization:
+                    `Bearer ${process.env.GITHUB_TOKEN}`,
+                  Accept: 'application/json',
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'IdeaBot-Feedback',
+                },
+                body: JSON.stringify({
+                  name: 'screenshot.jpg',
+                  size: binary.length,
+                  content_type: 'image/jpeg',
+                  repository_id: repo.data.id,
+                }),
+              }
+            );
+
+            if (!policyRes.ok) {
+              const text = await policyRes.text();
+              core.warning(
+                'Upload policy failed: ' +
+                policyRes.status + ' ' +
+                text.substring(0, 200)
+              );
+              return;
+            }
+
+            const policy = await policyRes.json();
+
+            const form = new FormData();
+            for (const [k, v] of Object.entries(policy.form)) {
+              form.append(k, v);
+            }
+            form.append(
+              'file',
+              new Blob([binary], { type: 'image/jpeg' })
+            );
+
+            const uploadRes = await fetch(policy.upload_url, {
+              method: 'POST',
+              body: form,
+            });
+
+            if (!uploadRes.ok) {
+              core.warning(
+                'S3 upload failed: ' + uploadRes.status
+              );
+              return;
+            }
+
+            const imageUrl = policy.asset.href;
+            core.info('Screenshot uploaded: ' + imageUrl);
+
+            const replaceRe = new RegExp(
+              '<!-- FEEDBACK_SCREENSHOT_BASE64\\s+' +
+              'data:image\\/\\S+' +
+              '\\s+FEEDBACK_SCREENSHOT_BASE64 -->',
+              's'
+            );
+            const newBody = body.replace(
+              replaceRe,
+              '## Screenshot\n\n' +
+              '![Screenshot](' + imageUrl + ')'
+            );
+
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: newBody,
+            });
+
+            core.info('Issue updated with screenshot');
